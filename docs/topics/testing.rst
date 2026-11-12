@@ -346,9 +346,8 @@ standard Django ``LiveServerTestCase``:
 
 .. note::
 
-    You can't use an in-memory database for your live tests. Therefore
-    include a test database file name in your settings to tell Django to
-    use a file database if you use SQLite:
+    If you use SQLite, include a test database file name in your settings to
+    tell Django to use a file database:
 
     .. code-block:: python
 
@@ -362,9 +361,112 @@ standard Django ``LiveServerTestCase``:
             },
         }
 
-serve_static
-~~~~~~~~~~~~
+    In-memory SQLite test databases are passed to the server thread (as
+    Django's own ``LiveServerTestCase`` does, sharing the connection between
+    the two threads), but a file database is recommended, and is what
+    Channels' own tests use, because the server thread shares the test
+    database with the test process and closes its database connections when
+    it stops.
 
-Subclass ``ChannelsLiveServerTestCase`` with ``serve_static = True`` in order
-to serve static files (comparable to Django's ``StaticLiveServerTestCase``, you
-don't need to run collectstatic before or as a part of your tests setup).
+The live server runs in a separate thread rather than a forked child process,
+so it no longer has to spawn and synchronise a separate process, and
+``manage.py test --parallel`` is supported.
+
+static_handler
+~~~~~~~~~~~~~~
+
+Subclass ``ChannelsLiveServerTestCase`` with ``static_handler`` set in order
+to customise how static files are served (Django's ``StaticLiveServerTestCase``
+uses ``ASGIStaticFilesHandler``, which is also the default here, so you don't
+need to run collectstatic before or as a part of your tests setup).
+
+The ``serve_static`` and ``static_wrapper`` attributes are gone, replaced by
+``static_handler``.
+
+server_thread_class
+~~~~~~~~~~~~~~~~~~~
+
+The server runs in a ``threading.Thread`` built from ``server_thread_class``,
+which defaults to ``channels.testing.live.ChannelsLiveServerThread``. Set it
+on a subclass to customise how the server is started or stopped.
+
+startup_timeout
+~~~~~~~~~~~~~~~
+
+``server_thread_class.startup_timeout`` (default: ``10``) is the number of
+seconds ``setUpClass()`` waits for the server to report that it is listening.
+If the server thread exits before then, its exception is raised instead.
+
+shutdown_grace_period
+~~~~~~~~~~~~~~~~~~~~~
+
+``server_thread_class.shutdown_grace_period`` (default: ``5``) is how many
+seconds a stopping server gives work which is already under way (in-flight
+requests, and thread-sensitive work started alongside them) to finish before
+the event loop is stopped.
+
+Stopping the loop underneath such work is not survivable: work bridging back
+into the loop stays blocked on a loop which will not run again, and the
+process-wide thread-sensitive worker running it never returns to its queue.
+Every later server in the same process would then queue behind that worker, so
+the grace period is what keeps a teardown from creating that state. It is only
+paid by a server which still has work in flight. Work that ignores cancellation
+cannot be stopped by the grace period, and may leave a worker that must be
+joined at interpreter exit.
+
+shutdown_cancel_timeout
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``server_thread_class.shutdown_cancel_timeout`` (default: ``5``) is how many
+seconds work cancelled at teardown gets to unwind before the event loop is
+closed underneath it. Closing the loop under pending work is not silent --
+asyncio reports the destroyed task, and any exception never retrieved -- so that
+work is cancelled and its outcome consumed first. Work which ignores
+cancellation is left behind with its report silenced: a teardown never waits for
+work which will not stop, and never prints anything.
+
+quiesce
+~~~~~~~
+
+Django flushes the test database at the end of every test and stops the live
+server only afterwards, so a request still running at that point would run its
+next query against rows which no longer exist. The server thread's
+``quiesce()`` is therefore called before the flush: it waits, for up to
+``shutdown_grace_period``, for requests whose client has gone, then retires the
+ones which are left. Only requests whose client has already gone are waited
+for: a request whose client is still connected is left to finish against the
+flushed test database, a deliberate trade-off rather than an oversight.
+
+Quiescing is part of the default thread, not of the extension point: a custom
+``server_thread_class`` need only provide the ``threading.Thread`` protocol plus
+``terminate()``, and is asked to quiesce only if it defines ``quiesce()``.
+
+One live server per process
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The live server takes ownership of the process-global state its reactor needs:
+the installed Twisted reactor, the event loop the reactor runs on, asgiref's
+process-wide thread-sensitive executor, and ``txaio``'s cached reactor. It
+installs or resets each of them when it starts, and restores or replaces each of
+them when it stops, so only one live server can run in a process at a time: a
+second one started while the first is still serving interferes with it. A test
+runner starts one at a time in each process, so an ordinary class -- or a
+``--parallel`` worker -- is unaffected.
+
+Private dependencies
+~~~~~~~~~~~~~~~~~~~~
+
+The thread-based live server builds on these private interfaces, which are
+therefore required at these minimum versions:
+
+* ``daphne.testing._reinstall_reactor`` (daphne 4.0+), for a reactor of its own
+  per server thread.
+* ``daphne.server.Server.connections``, ``WSProtocol.muted`` and
+  ``WSProtocol.application_queue`` (daphne 4.0+), for draining in-flight
+  requests and retiring open websockets.
+* ``reactor._asyncioEventloop`` (Twisted's asyncio reactor), for closing the
+  loop the reactor ran on.
+* ``SyncToAsync.single_thread_executor`` (asgiref 3.9+), for giving each server
+  its own thread-sensitive executor. Without it the server logs why, and runs
+  without that isolation.
+
